@@ -155,3 +155,43 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
+
+
+class AxiomLLM(nn.Module):
+    """
+    The complete autoregressive language model.
+    Combines Token Embeddings, Transformer Blocks, and the LM Head.
+    """
+    def __init__(self, vocab_size: int, embed_dim: int, num_heads: int, num_layers: int):
+        super().__init__()
+        # 1. Token Embeddings (Lookup table)
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # 2. The Transformer Core (Stack of Blocks)
+        self.layers = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
+        ])
+        
+        # 3. Final Normalization
+        self.final_norm = RMSNorm(embed_dim)
+        
+        # 4. The Language Model Head (Projects back to vocabulary size)
+        # Note: We tie the weights of the LM head to the token embeddings to save parameters.
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
+        
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # input_ids shape: [batch, seq_len]
+        
+        # 1. Lookup embeddings: [batch, seq_len] -> [batch, seq_len, embed_dim]
+        x = self.token_embedding(input_ids)
+        
+        # 2. Pass through all transformer blocks
+        for layer in self.layers:
+            x = layer(x)
+            
+        # 3. Final norm
+        x = self.final_norm(x)
+        
+        # 4. Project to vocabulary logits: [batch, seq_len, vocab_size]
+        logits = self.lm_head(x)
+        return logits
