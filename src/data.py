@@ -1,4 +1,4 @@
-# src/data.py
+
 import torch
 import logging
 from torch.utils.data import Dataset, DataLoader
@@ -14,7 +14,7 @@ class PackedDataset(Dataset):
     def __init__(self, token_ids: list[int], seq_len: int):
         self.token_ids = token_ids
         self.seq_len = seq_len
-        # Calculate how many full sequences we can extract
+        
         self.num_sequences = (len(self.token_ids) - 1) // seq_len
 
     def __len__(self) -> int:
@@ -25,7 +25,7 @@ class PackedDataset(Dataset):
         end = start + self.seq_len + 1
         chunk = self.token_ids[start:end]
         
-        # Causal alignment: Input is tokens 0 to N-1, Target is tokens 1 to N
+       
         input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
         labels = torch.tensor(chunk[1:], dtype=torch.long)
         return input_ids, labels
