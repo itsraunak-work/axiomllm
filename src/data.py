@@ -3,6 +3,7 @@ import torch
 import logging
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
+from src.tokenizer import AxiomTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class PackedDataset(Dataset):
 def prepare_dataloader(
     dataset_name: str,
     split: str,
-    tokenizer: 'AxiomTokenizer',
+    tokenizer: AxiomTokenizer,
     seq_len: int,
     batch_size: int,
     max_samples: int = 10000
