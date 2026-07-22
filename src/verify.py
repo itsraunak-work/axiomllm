@@ -1,4 +1,4 @@
-# scripts/verify.py
+
 import sys
 import os
 from pathlib import Path
@@ -27,7 +27,7 @@ def main() -> None:
     
     tokenizer = AxiomTokenizer(vocab_size=cfg.model.vocab_size)
     
-    # For testing, we just use a dummy text file so we don't wait for HF downloads
+   
     dummy_file = "assets/dummy_corpus.txt"
     if not os.path.exists(dummy_file):
         with open(dummy_file, "w", encoding="utf-8") as f:
@@ -36,7 +36,7 @@ def main() -> None:
     else:
         tokenizer.load()
 
-    # Test encoding
+    
     test_ids = tokenizer.encode("Hello world, AxiomLLM is online.")
     logger.info(f"Encoded test string: {test_ids}")
     logger.info(f"Decoded back: {tokenizer.decode(test_ids)}")
