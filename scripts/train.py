@@ -56,12 +56,13 @@ def train():
 
     # 3. Initialize Model
     logger.info(f"Initializing AxiomLLM on {device}...")
-    model = AxiomLLM(
-        vocab_size=cfg.model.vocab_size,
-        embed_dim=cfg.model.embed_dim,
-        num_heads=cfg.model.num_heads,
-        num_layers=cfg.model.num_layers
-    ).to(device)
+    #model = AxiomLLM(
+    #    vocab_size=cfg.model.vocab_size,
+    #    embed_dim=cfg.model.embed_dim,
+    #    num_heads=cfg.model.num_heads,
+    #    num_layers=cfg.model.num_layers
+    #).to(device)
+    model = AxiomLLM(cfg.model).to(device)
 
     # 4. Optimizer & Scaler
     # AdamW decouples weight decay from gradient updates, crucial for Transformers
@@ -90,14 +91,14 @@ def train():
             
             # Forward Pass with Mixed Precision
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                logits = model(input_ids)
+                logits, aux_loss = model(input_ids)
                 
-                # Calculate Loss
-                # logits: [batch, seq_len, vocab_size] -> [batch*seq_len, vocab_size]
-                # labels: [batch, seq_len] -> [batch*seq_len]
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+                # Calculate standard Cross-Entropy Loss
+                ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
                 
-                # Scale loss for FP16 gradient accumulation
+                # Add Auxiliary Load-Balancing Loss (scaled by alpha=0.01)
+                loss = ce_loss + (0.01 * aux_loss)
+                
                 loss = loss / cfg.training.gradient_accumulation_steps
             
             # Backward Pass

@@ -1,4 +1,7 @@
 model:
+  use_moe: true
+  num_experts: 8
+  top_k: 2
   vocab_size: 50257
   max_seq_len: 1024
   embed_dim: 768
