@@ -62,136 +62,180 @@ class RoPE(nn.Module):
         return rotated.flatten(-2)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int):
+
+
+class SwiGLU(nn.Module):
+    """
+    DeepSeek/LLaMA style Feed-Forward Network.
+    Uses a gating mechanism for better gradient flow and representation.
+    """
+    def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        
+        # We use 3 matrices. To keep FLOPs similar to standard MLP, 
+        # hidden_dim is usually set to (8/3) * dim, rounded to nearest multiple of 256.
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False) # Gate projection
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False) # Down projection
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False) # Up projection
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SiLU is the Swish activation: x * sigmoid(x)
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class MLA(nn.Module):
+    """
+    Multi-head Latent Attention (DeepSeek-V2 style).
+    Uses low-rank compression for the KV Cache to save massive amounts of VRAM.
+    """
+    def __init__(self, embed_dim: int, num_heads: int, latent_dim: int = None):
+        super().__init__()
+        assert embed_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5  # 1 / sqrt(head_dim)
+        self.scale = self.head_dim ** -0.5
         
-        # Separate projections for clarity (fused QKV is a production optimization)
+        # If latent_dim not specified, default to 1/4 of embed_dim (DeepSeek ratio)
+        self.latent_dim = latent_dim or (embed_dim // 4)
+
+        # Query Projections (Standard)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         
+        # KV Joint Compression (The MLA Magic)
+        # 1. Down-project to tiny latent space
+        self.kv_down_proj = nn.Linear(embed_dim, self.latent_dim, bias=False)
+        # 2. Up-project back to full head dimensions on the fly
+        self.k_up_proj = nn.Linear(self.latent_dim, embed_dim, bias=False)
+        self.v_up_proj = nn.Linear(self.latent_dim, embed_dim, bias=False)
+        
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.rope = RoPE(self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, embed_dim = x.shape
+        B, T, C = x.shape
         
-        # Step 1: Project input into Q, K, V
-        # Each has shape: [batch, seq_len, embed_dim]
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # 1. Standard Query generation
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Step 2: Reshape for multi-head attention
-        # [batch, seq_len, embed_dim] -> [batch, seq_len, num_heads, head_dim]
-        q = q.view(batch, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch, seq_len, self.num_heads, self.head_dim)
-        v = v.view(batch, seq_len, self.num_heads, self.head_dim)
+        # 2. MLA: Compress to Latent Space (This is what goes into the VRAM Cache)
+        latent_kv = self.kv_down_proj(x) # Shape: [B, T, latent_dim]
         
-        # Step 3: Transpose to [batch, num_heads, seq_len, head_dim]
-        # This puts heads in the batch dimension for parallel matmul
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # 3. MLA: Reconstruct K and V on the fly in GPU Registers
+        k = self.k_up_proj(latent_kv).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_up_proj(latent_kv).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Step 4: Apply RoPE to Q and K (injects positional information)
+        # 4. Apply RoPE to Q and K
         q = self.rope(q)
         k = self.rope(k)
         
-        # Step 5: Compute attention scores
-        # Q @ K^T -> [batch, num_heads, seq_len, seq_len]
+        # 5. Attention Math (Identical to standard, but K/V came from latent space)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # Step 6: Apply causal mask (prevent looking at future tokens)
-        # Create lower-triangular boolean mask: [seq_len, seq_len]
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-        # Invert: True where we want to mask (upper triangle)
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
         scores = scores.masked_fill(~causal_mask, float('-inf'))
-        
-        # Step 7: Softmax to get attention weights (probabilities)
-        # Shape: [batch, num_heads, seq_len, seq_len]
         weights = F.softmax(scores, dim=-1)
         
-        # Step 8: Weighted sum of Values
-        # [batch, num_heads, seq_len, seq_len] @ [batch, num_heads, seq_len, head_dim]
-        # -> [batch, num_heads, seq_len, head_dim]
         context = torch.matmul(weights, v)
+        context = context.transpose(1, 2).contiguous().view(B, T, C)
         
-        # Step 9: Transpose back and reshape to original embedding dim
-        # [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
-        context = context.transpose(1, 2).contiguous()
-        # [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, embed_dim]
-        context = context.view(batch, seq_len, embed_dim)
-        
-        # Step 10: Final linear projection (mix information across heads)
         return self.out_proj(context)
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, mlp_ratio: float = 4.0):
+class MoE(nn.Module):
+    """
+    Mixture of Experts.
+    Routes tokens to Top-K experts for sparse, efficient compute.
+    """
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 8, top_k: int = 2):
         super().__init__()
-        # Sub-layer 1: Attention with Pre-Norm
-        self.norm1 = RMSNorm(embed_dim)
-        self.attn = CausalSelfAttention(embed_dim, num_heads)
+        self.num_experts = num_experts
+        self.top_k = top_k
         
-        # Sub-layer 2: MLP with Pre-Norm
-        self.norm2 = RMSNorm(embed_dim)
-        hidden_dim = int(embed_dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_dim, embed_dim, bias=False)
-        )
+        # The API Gateway (Router)
+        self.router = nn.Linear(dim, num_experts, bias=False)
+        
+        # The Microservices (Experts)
+        self.experts = nn.ModuleList([SwiGLU(dim, hidden_dim) for _ in range(num_experts)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-Norm architecture: Normalize BEFORE the sub-layer
-        # Residual connection: Add original input to sub-layer output
+        B, T, C = x.shape
+        x_flat = x.view(-1, C) # [B*T, C]
+        
+        # 1. Router calculates probabilities for each expert
+        router_logits = self.router(x_flat) # [B*T, num_experts]
+        routing_weights = F.softmax(router_logits, dim=-1)
+        
+        # 2. Select Top-K experts for each token
+        topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1) # [B*T, K]
+        
+        # 3. Normalize the top-k weights so they sum to 1
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        
+        # 4. Route tokens and accumulate outputs
+        out = torch.zeros_like(x_flat)
+        
+        for i in range(self.num_experts):
+            # Find which tokens were routed to Expert 'i'
+            mask = (topk_indices == i).any(dim=-1) # Boolean mask [B*T]
+            
+            if mask.any():
+                # Process only the routed tokens through this expert
+                expert_input = x_flat[mask]
+                expert_out = self.experts[i](expert_input)
+                
+                # Find the specific routing weight for Expert 'i' for these tokens
+                # (We need to extract the weight from the topk_weights tensor)
+                expert_idx_in_topk = (topk_indices[mask] == i).nonzero(as_tuple=True)[1]
+                weight = topk_weights[mask, expert_idx_in_topk].unsqueeze(-1)
+                
+                # Accumulate the weighted expert output
+                out[mask] += expert_out * weight
+                
+        return out.view(B, T, C)
+
+
+class DeepSeekBlock(nn.Module):
+    """
+    AxiomLLM Transformer Block using MLA and MoE.
+    """
+    def __init__(self, embed_dim: int, num_heads: int, num_experts: int = 8, top_k: int = 2):
+        super().__init__()
+        self.norm1 = RMSNorm(embed_dim)
+        self.attn = MLA(embed_dim, num_heads)
+        
+        self.norm2 = RMSNorm(embed_dim)
+        
+        # MoE hidden dim calculation (approx 8/3 * dim for SwiGLU equivalence)
+        moe_hidden_dim = int(embed_dim * 8 / 3)
+        # Round to nearest multiple of 256 for GPU tensor core alignment
+        moe_hidden_dim = ((moe_hidden_dim + 255) // 256) * 256 
+        
+        self.moe = MoE(embed_dim, moe_hidden_dim, num_experts, top_k)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.moe(self.norm2(x))
         return x
 
 
 class AxiomLLM(nn.Module):
     """
     The complete autoregressive language model.
-    Combines Token Embeddings, Transformer Blocks, and the LM Head.
     """
-    def __init__(self, vocab_size: int, embed_dim: int, num_heads: int, num_layers: int):
+    def __init__(self, vocab_size: int, embed_dim: int, num_heads: int, num_layers: int, num_experts: int = 8):
         super().__init__()
-        # 1. Token Embeddings (Lookup table)
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         
-        # 2. The Transformer Core (Stack of Blocks)
+        # Stack DeepSeek Blocks
         self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
+            DeepSeekBlock(embed_dim, num_heads, num_experts) for _ in range(num_layers)
         ])
         
-        # 3. Final Normalization
         self.final_norm = RMSNorm(embed_dim)
-        
-        # 4. The Language Model Head (Projects back to vocabulary size)
-        # Note: We tie the weights of the LM head to the token embeddings to save parameters.
         self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
         
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # input_ids shape: [batch, seq_len]
-        
-        # 1. Lookup embeddings: [batch, seq_len] -> [batch, seq_len, embed_dim]
         x = self.token_embedding(input_ids)
-        
-        # 2. Pass through all transformer blocks
         for layer in self.layers:
             x = layer(x)
-            
-        # 3. Final norm
         x = self.final_norm(x)
-        
-        # 4. Project to vocabulary logits: [batch, seq_len, vocab_size]
         logits = self.lm_head(x)
         return logits
