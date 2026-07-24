@@ -88,7 +88,7 @@ def chat():
                 print(text, end="", flush=True)
                 
                 # Stop condition
-                if next_token_id == tokenizer.tokenizer.token_to_id("<eos>"):
+                if next_token_id == tokenizer._tokenizer.token_to_id("<eos>"):
                     break
                     
         print() # Newline after generation
