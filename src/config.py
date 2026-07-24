@@ -1,6 +1,6 @@
 import yaml
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 @dataclass
 class ModelConfig:
@@ -12,20 +12,19 @@ class ModelConfig:
     head_dim: int = 64
     mlp_ratio: float = 4.0
     use_rope: bool = True
-    dropout: float = 0.1
-    
-    # --- DeepSeek-V2 style Multi-Head Latent Attention (MLA) ---
     use_mla: bool = True
+    mla_rank: int = 32
+    dropout: float = 0.1
+    # MoE settings
+    use_moe: bool = False
+    num_experts: int = 8
+    top_k: int = 2
+    # MLA dimensions (read by AxiomLLM / MultiHeadLatentAttention)
     kv_lora_rank: int = 32
     qk_nope_head_dim: int = 32
     qk_rope_head_dim: int = 32
     v_head_dim: int = 64
-    q_lora_rank: Optional[int] = None
-
-    # --- DeepSeek-V2 style Mixture of Experts (MoE) ---
-    use_moe: bool = True
-    num_experts: int = 8
-    top_k: int = 2
+    q_lora_rank: int | None = None
 
 @dataclass
 class TrainingConfig:

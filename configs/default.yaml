@@ -1,7 +1,4 @@
 model:
-  use_moe: true
-  num_experts: 8
-  top_k: 2
   vocab_size: 50257
   max_seq_len: 1024
   embed_dim: 768
@@ -10,9 +7,20 @@ model:
   head_dim: 64
   mlp_ratio: 4.0
   use_rope: true
-  use_mla: true
-  mla_rank: 32
   dropout: 0.1
+  
+  # DeepSeek-V2 MLA
+  use_mla: true
+  kv_lora_rank: 32
+  qk_nope_head_dim: 32
+  qk_rope_head_dim: 32
+  v_head_dim: 64
+  q_lora_rank: 96
+  
+  # DeepSeek-V2 MoE
+  use_moe: true
+  num_experts: 8
+  top_k: 2
 
 training:
   batch_size: 2
